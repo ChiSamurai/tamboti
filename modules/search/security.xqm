@@ -1392,3 +1392,75 @@ declare function security:iiifauth-remove-cookie($cookie as xs:string) {
             update delete $cookie-doc/cookies/cookie[@value = $cookie]
     ))
 };
+
+(:~
+: get the resulting ACL mode by evaulationg each ACE step by step 
+: @param permission the inital permission mode (i.e. "---" or "r-x")
+: @param aces sequence with the relevant ACEs (response from sm:get-permissions). You have to prefilter them (i.e. $permissions/sm:permission/sm:acl/sm:ace[(@target="USER" and @who=$user) 
+:)
+
+declare %private function security:_calculate-ace-final-mode($permission as xs:string, $aces as item()*) {
+    let $this-ace := $aces[1]
+    let $this-type := $this-ace/@access_type
+    let $this-mode := $this-ace/@mode
+    let $new-permission := 
+        if ($this-type = "ALLOWED") then
+                let $permission := if(matches($this-mode, "r..")) then fn:replace($permission, ".(.)(.)", "r$1$2") else $permission
+                let $permission := if(matches($this-mode, ".w.")) then fn:replace($permission, "(.).(.)", "$1w$2") else $permission
+                let $permission := if(matches($this-mode, "..x")) then fn:replace($permission, "(.)(.).", "$1$2x") else $permission
+                return
+                    $permission
+        else
+                let $permission := if(matches($this-mode, "r..")) then fn:replace($permission, ".(.)(.)", "-$1$2") else $permission
+                let $permission := if(matches($this-mode, ".w.")) then fn:replace($permission, "(.).(.)", "$1-$2") else $permission
+                let $permission := if(matches($this-mode, "..x")) then fn:replace($permission, "(.)(.).", "$1$2-") else $permission
+                return
+                    $permission
+    return
+        if (count($aces) > 1) then
+            security:_calculate-ace-final-mode($new-permission, subsequence($aces, 2))
+        else
+            $new-permission
+};
+
+(:~
+: gets the mode a user has for a collection - under consideration of posix (user/group/other) and ACL permissions  
+:)
+
+declare function security:get-user-permissions($user as xs:string, $col-or-res as xs:anyURI) {
+    let $permissions := sm:get-permissions($col-or-res)
+    let $usergroups := sm:get-user-groups($user)
+    
+    let $is-owner := $permissions/sm:permission/@owner/string() = $user
+    let $has-group := $permissions/sm:permission/@group/string() = $usergroups
+    
+    (: check POSIX access :)
+    let $user-access := 
+        if($is-owner) then
+            substring($permissions/sm:permission/@mode, 1, 3)
+        else
+            "---"
+    let $group-access := 
+        if ($has-group) then
+            substring($permissions/sm:permission/@mode, 4, 3)
+        else
+            "---"
+    
+    let $others-access := 
+        substring($permissions/sm:permission/@mode, 7, 3)
+    
+    let $overall-posix-permission := if (matches($group-access, "[^-]..")) then fn:replace($user-access, ".(.)(.)", "r$1$2") else $user-access
+    let $overall-posix-permission := if (matches($group-access, ".[^-].")) then fn:replace($user-access, "(.).(.)", "$1r$2") else $user-access
+    let $overall-posix-permission := if (matches($group-access, "..[^-]")) then fn:replace($user-access, "(.)(.).", "$1$2r") else $user-access
+    
+    let $overall-posix-permission := if (matches($others-access, "[^-]..")) then fn:replace($overall-posix-permission, ".(.)(.)", "r$1$2") else $overall-posix-permission
+    let $overall-posix-permission := if (matches($others-access, ".[^-].")) then fn:replace($overall-posix-permission, "(.).(.)", "$1w$2") else $overall-posix-permission
+    let $overall-posix-permission := if (matches($others-access, "..[^-]")) then fn:replace($overall-posix-permission, "(.)(.).", "$1$2x") else $overall-posix-permission
+    
+    
+    let $aces := $permissions/sm:permission/sm:acl/sm:ace[(@target="USER" and @who=$user) or (@target="GROUP" and @who=$usergroups)]
+    
+    let $resulting-overall-permission := security:_calculate-ace-final-mode($overall-posix-permission, $aces)
+    return
+        $resulting-overall-permission
+};
